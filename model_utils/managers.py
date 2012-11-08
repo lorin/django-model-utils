@@ -1,3 +1,4 @@
+import itertools
 from types import ClassType
 import warnings
 
@@ -8,12 +9,81 @@ from django.db.models.manager import Manager
 from django.db.models.query import QuerySet
 
 
+def get_subclass_relations(model):
+    """Return a list of relations to subclassed models.
+
+    """
+    return [rel for rel in model._meta.get_all_related_objects()
+                          if isinstance(rel.field, OneToOneField)
+                          and issubclass(rel.field.model, model)]
+
+
+def flatten(x):
+    """Flatten a list nested one deep
+
+    Actually returns an iterable, not a list.
+
+    >>> flatten([[1, 2, 3], [4], [5,6]])
+    [1, 2, 3, 4, 5, 6]
+    """
+    return itertools.chain.from_iterable(x)
+
+
+def get_subclass_relations_helper(relation, str_to_prepend):
+    child_relations = get_subclass_relations(relation.model)
+    if not child_relations:
+        # Base case, no descendents
+        return [str_to_prepend + relation.var_name]
+    else:
+        # Recursive case
+        new_str_to_prepend = "%s%s__" % (str_to_prepend, relation.var_name)
+        return flatten([get_subclass_relations_helper(rel,
+                                                      new_str_to_prepend)
+                        for rel in child_relations])
+
+
+def get_subclass_queries(parent):
+    """ Return the list of subclass relations, to be passed to select_related
+
+    >>> get_subclass_queries(Animal)
+    ['mammal__dog', 'mammal__cat', 'bird__canary']
+
+    """
+    child_relations = get_subclass_relations(parent)
+    if not child_relations:
+        # Base case, no kids
+        return []
+    else:
+        return list(flatten([get_subclass_relations_helper(rel, '')
+                        for rel in child_relations]))
+
+
+def downcast(obj, fieldlookup):
+    """Downcast the object based on the relation
+
+    Example:
+
+    >>> animal = Animal.objects.get(...)
+    >>> downcast(animal, "mammal__sheep"")
+    <Sheep: molly>
+
+    """
+    def downcast_helper(obj, fieldlist):
+        if obj is None:
+            return None
+
+        if not fieldlist:
+            return obj
+        else:
+            return downcast_helper(getattr(obj, fieldlist[0]), fieldlist[1:])
+
+    return downcast_helper(obj, fieldlookup.split("__"))
+
+
 class InheritanceQuerySet(QuerySet):
     def select_subclasses(self, *subclasses):
         if not subclasses:
-            subclasses = [rel.var_name for rel in self.model._meta.get_all_related_objects()
-                          if isinstance(rel.field, OneToOneField)
-                          and issubclass(rel.field.model, self.model)]
+            subclasses = get_subclass_queries(self.model)
         new_qs = self.select_related(*subclasses)
         new_qs.subclasses = subclasses
         return new_qs
@@ -31,9 +101,10 @@ class InheritanceQuerySet(QuerySet):
 
     def iterator(self):
         iter = super(InheritanceQuerySet, self).iterator()
+        #import ipdb; ipdb.set_trace()
         if getattr(self, 'subclasses', False):
             for obj in iter:
-                sub_obj = [getattr(obj, s) for s in self.subclasses if getattr(obj, s)] or [obj]
+                sub_obj = [downcast(obj, s) for s in self.subclasses if downcast(obj, s)] or [obj]
                 sub_obj = sub_obj[0]
                 if getattr(self, '_annotated', False):
                     for k in self._annotated:
